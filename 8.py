@@ -1,110 +1,95 @@
 import aiohttp
 import asyncio
 import logging
-from datetime import datetime, timedelta
+import json
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from concurrent.futures import ThreadPoolExecutor
+import socketserver
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-class AuthProxy:
-    def __init__(self, base_url, auth_config):
-        self.base_url = base_url
-        self.auth_config = auth_config
-        self.token = None
-        self.token_expiry = None
+class MockAPIHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.headers.get("X-API-Key") != "test-api-key":
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Invalid API key"}).encode())
+            logger.warning("Invalid API key received")
+            return
+        content_length = int(self.headers["Content-Length"])
+        data = json.loads(self.rfile.read(content_length))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        response = {"message": "Success", "data": data}
+        self.wfile.write(json.dumps(response).encode())
+        logger.info(f"Mock server responded: {response}")
 
-    async def get_token(self):
-        if self.auth_config["type"] == "jwt":
-            if self.token and self.token_expiry > datetime.now():
-                return self.token
-            logger.info("Fetching new JWT token")
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    self.auth_config["token_url"],
-                    json={"client_id": self.auth_config["client_id"], "client_secret": self.auth_config["client_secret"]}
-                ) as response:
-                    data = await response.json()
-                    self.token = data["access_token"]
-                    self.token_expiry = datetime.now() + timedelta(seconds=data["expires_in"])
-                    return self.token
-        return self.auth_config.get("api_key")
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    pass
+
+class AuthProxy:
+    def __init__(self, base_url, api_key):
+        self.base_url = base_url
+        self.api_key = api_key
 
     async def request(self, method, endpoint, **kwargs):
         url = f"{self.base_url}{endpoint}"
         headers = kwargs.get("headers", {})
-
-        if self.auth_config["type"] == "api_key":
-            headers["X-API-Key"] = await self.get_token()
-        else:
-            headers["Authorization"] = f"Bearer {await self.get_token()}"
-
+        headers["X-API-Key"] = self.api_key
         kwargs["headers"] = headers
+
         async with aiohttp.ClientSession() as session:
             logger.info(f"Sending {method} request to {url}")
-            async with session.request(method, url, **kwargs) as response:
-                if response.status == 401 and self.auth_config["type"] == "jwt":
-                    logger.info("Token expired, renewing")
-                    self.token = None
-                    headers["Authorization"] = f"Bearer {await self.get_token()}"
-                    async with session.request(method, url, headers=headers, **kwargs) as retry_response:
-                        data = await retry_response.json()
-                        logger.info(f"Received response: {retry_response.status} {data}")
-                        return data
-                data = await response.json()
-                logger.info(f"Received response: {response.status} {data}")
-                return data
+            try:
+                async with session.request(method, url, **kwargs) as response:
+                    data = await response.json()
+                    logger.info(f"Received response: {response.status} {data}")
+                    return data
+            except aiohttp.ClientError as e:
+                logger.error(f"Error in request: {e}")
+                raise
 
-async def mock_auth_server():
-    async def handler(request):
-        data = await request.json()
-        if data.get("client_id") == "test_client" and data.get("client_secret") == "test_secret":
-            return aiohttp.web.json_response({"access_token": "jwt_token", "expires_in": 5})
-        return aiohttp.web.json_response({"error": "Invalid credentials"}, status=401)
+async def start_mock_server():
+    server = ThreadedHTTPServer(("localhost", 8080), MockAPIHandler)
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop = asyncio.get_running_loop()
 
-    app = aiohttp.web.Application()
-    app.router.add_post("/auth/token", handler)
-    runner = aiohttp.web.AppRunner(app)
-    await runner.setup()
-    site = aiohttp.web.TCPSite(runner, "localhost", 8081)
-    await site.start()
-    return runner
+    def run_server():
+        try:
+            server.serve_forever()
+        except Exception as e:
+            logger.error(f"Server error: {e}")
 
-async def mock_api_server():
-    async def handler(request):
-        auth_header = request.headers.get("Authorization")
-        if auth_header != "Bearer jwt_token":
-            return aiohttp.web.json_response({"error": "Invalid or expired token"}, status=401)
-        return aiohttp.web.json_response({"message": "Success", "data": await request.json()})
+    server_task = loop.run_in_executor(executor, run_server)
+    logger.info("Mock API server started on http://localhost:8080")
+    return server, server_task, executor
 
-    app = aiohttp.web.Application()
-    app.router.add_post("/api/test", handler)
-    runner = aiohttp.web.AppRunner(app)
-    await runner.setup()
-    site = aiohttp.web.TCPSite(runner, "localhost", 8080)
-    await site.start()
-    return runner
+async def stop_mock_server(server, server_task, executor):
+    try:
+        server.shutdown()
+        server.server_close()
+        executor.shutdown(wait=True)
+        await server_task
+        logger.info("Mock API server stopped")
+    except Exception as e:
+        logger.error(f"Error stopping server: {e}")
 
 async def main():
-    auth_server = await mock_auth_server()
-    api_server = await mock_api_server()
+    try:
+        server, server_task, executor = await start_mock_server()
+        proxy = AuthProxy("http://localhost:8080", "test-api-key")
 
-    auth_config = {
-        "type": "jwt",
-        "token_url": "http://localhost:8081/auth/token",
-        "client_id": "test_client",
-        "client_secret": "test_secret"
-    }
-    proxy = AuthProxy("http://localhost:8080", auth_config)
+        print("Test 1: Basic API Key Authentication")
+        response = await proxy.request("POST", "/api/test", json={"value": 42})
+        print(f"Response: {response}")
 
-    print("Test 2: JWT Authentication with Token Renewal")
-    response1 = await proxy.request("POST", "/api/test", json={"value": 42})
-    print(f"Response 1: {response1}")
-    await asyncio.sleep(6)
-    response2 = await proxy.request("POST", "/api/test", json={"value": 43})
-    print(f"Response 2: {response2}")
-
-    await auth_server.cleanup()
-    await api_server.cleanup()
+        await stop_mock_server(server, server_task, executor)
+    except Exception as e:
+        print(f"Test failed: {e}")
+        logger.error(f"Test error: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
