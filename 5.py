@@ -7,6 +7,9 @@ async def async_map_callback(arr: List[Any], callback: Callable[[Any], Any], don
         result.append(await callback(item))
     done(result)
 
+async def async_map_promise(arr: List[Any], callback: Callable[[Any], Any]) -> List[Any]:
+    return await asyncio.gather(*(callback(item) for item in arr))
+
 async def example_callback(item: Any) -> Any:
     await asyncio.sleep(1)
     return item * 2
@@ -18,3 +21,6 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     print("Test 1: Callback-based async map")
     loop.run_until_complete(async_map_callback([1, 2, 3], example_callback, done_callback))
+    print("\nTest 2: Promise-based async map")
+    result = loop.run_until_complete(async_map_promise([1, 2, 3], example_callback))
+    print(f"Promise result: {result}")
