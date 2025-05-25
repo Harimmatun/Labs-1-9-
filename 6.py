@@ -39,7 +39,11 @@ async def example_processor(item: Any) -> Any:
 async def cancellable_example():
     cancel_event = asyncio.Event()
     asyncio.get_event_loop().call_later(0.3, cancel_event.set)
-    await process_stream_cancellable(data_stream(10), example_processor, cancel_event)
+    try:
+        await process_stream_cancellable(data_stream(10), example_processor, cancel_event)
+    except asyncio.CancelledError:
+        print("Cancellable stream processing was stopped gracefully")
+    print("Cancellable example completed")
 
 if __name__ == "__main__":
     print("Test 3: Stream Processing with Cancellation")
